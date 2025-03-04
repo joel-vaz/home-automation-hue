@@ -13,7 +13,7 @@ fuzzywuzzy==0.18.0
 python-Levenshtein==0.20.9
 
 # For macOS notifications (optional)
-# pyobjus==1.2.3  # Uncomment if on macOS and want native notifications
+pyobjus==1.2.3  # Uncomment if on macOS and want native notifications
 
 # For Windows text-to-speech (optional)
 # pyttsx3==2.90  # Uncomment if on Windows and want voice feedback

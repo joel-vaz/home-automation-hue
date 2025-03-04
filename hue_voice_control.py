@@ -19,6 +19,7 @@ load_dotenv()
 # Bridge configuration
 BRIDGE_IP = os.getenv("HUE_BRIDGE_IP")
 CONFIG_FILE = "bridge_config.json"
+WAKE_WORD = "philips"
 
 class HueVoiceControl:
     def __init__(self):
@@ -69,6 +70,7 @@ class HueVoiceControl:
             logger.info("Calibrating for ambient noise... Please wait")
             self.recognizer.adjust_for_ambient_noise(source, duration=2)
             logger.info("Listening for commands...")
+            logger.info(f"Wake word activated: Say '{WAKE_WORD}' before commands")
             
             while True:
                 try:
@@ -76,9 +78,21 @@ class HueVoiceControl:
                     logger.info("Processing speech...")
                     
                     text = self.recognizer.recognize_google(audio).lower()
-                    logger.info(f"Recognized: {text}")
                     
-                    self.process_command(text)
+                    # Check if wake word is present at the beginning of the command
+                    if text.startswith(WAKE_WORD):
+                        # Extract the actual command (everything after the wake word)
+                        command = text[len(WAKE_WORD):].strip()
+                        
+                        # Only process if there's an actual command after the wake word
+                        if command:
+                            logger.info(f"Wake word detected! Processing: {command}")
+                            self.process_command(command)
+                        else:
+                            logger.info(f"Wake word detected, but no command followed")
+                    else:
+                        # Wake word not detected, log but don't process
+                        logger.info(f"Ignored (no wake word): {text}")
                     
                 except sr.WaitTimeoutError:
                     pass
@@ -281,6 +295,8 @@ class HueVoiceControl:
 
 def main():
     try:
+        logger.info(f"Starting Hue Voice Control with wake word: '{WAKE_WORD}'")
+        logger.info("Say the wake word before every command (e.g., 'philips turn on lights')")
         controller = HueVoiceControl()
         controller.listen()
     except KeyboardInterrupt:
