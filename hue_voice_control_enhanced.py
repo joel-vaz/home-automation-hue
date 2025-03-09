@@ -55,6 +55,19 @@ COMMAND_ALIASES = {
     "brightness": ["set to", "percent", "level", "intensity"]
 }
 
+# Configuration settings
+CONFIG = {
+    "cooldown_period": 5,          # Seconds to wait after a command before listening again
+    "speech_volume": 1.0,          # Volume for text-to-speech (0.0 to 1.0)
+    "ambient_noise_duration": 2,   # Seconds to calibrate for ambient noise
+    "command_timeout": 5,          # Seconds to wait for a command
+    "phrase_time_limit": 5,        # Maximum length of a spoken phrase
+    "cache_ttl": 60,               # Seconds to cache light information
+    "max_command_history": 10,     # Number of commands to keep in history
+    "max_state_history": 5,        # Number of light states to keep for undo
+    "debug_mode": False            # Enable/disable debug logging
+}
+
 def send_notification(title, message, timeout=2):
     """Send a desktop notification with fallback to console output"""
     try:
@@ -120,15 +133,19 @@ def play_sound(sound_type):
     except Exception as e:
         logger.debug(f"Could not play sound: {str(e)}")
 
-def speak_text(text):
+def speak_text(text, volume=None):
     """Convert text to speech for voice feedback
     
     Uses built-in 'say' command on macOS and pyttsx3 on Windows
     """
     try:
+        # Use configured volume if not specified
+        if volume is None:
+            volume = CONFIG["speech_volume"]
+            
         if os.name == 'posix':  # macOS or Linux
-            # Use the built-in 'say' command on macOS
-            subprocess.Popen(['say', text], 
+            # Use the built-in 'say' command on macOS with volume control
+            subprocess.Popen(['say', '-v', 'Alex', '-r', '175', text], 
                            stdout=subprocess.DEVNULL, 
                            stderr=subprocess.DEVNULL)
         elif os.name == 'nt':  # Windows
@@ -136,6 +153,8 @@ def speak_text(text):
             try:
                 import pyttsx3
                 engine = pyttsx3.init()
+                engine.setProperty('rate', 150)  # Speed (words per minute)
+                engine.setProperty('volume', volume)  # Volume level (0.0 to 1.0)
                 engine.say(text)
                 engine.runAndWait()
             except ImportError:
@@ -145,6 +164,16 @@ def speak_text(text):
             logger.info(f"Text-to-speech: {text}")
     except Exception as e:
         logger.error(f"Error with text-to-speech: {str(e)}")
+
+def set_speech_volume(volume):
+    """Set the volume for text-to-speech output (0.0 to 1.0)"""
+    if 0.0 <= volume <= 1.0:
+        CONFIG["speech_volume"] = volume
+        logger.info(f"Speech volume set to {volume}")
+        return True
+    else:
+        logger.error(f"Invalid volume level: {volume}. Must be between 0.0 and 1.0")
+        return False
 
 class WakeWordListener(threading.Thread):
     """Thread for local wake word detection"""
@@ -432,61 +461,66 @@ class ThreadedRecognizer(threading.Thread):
 class CommandProcessor(threading.Thread):
     """Thread for processing voice commands"""
     
-    def __init__(self, command_queue, error_queue, bridge):
+    def __init__(self, command_queue, error_queue, bridge, mic_thread=None):
         threading.Thread.__init__(self)
         self.command_queue = command_queue
         self.error_queue = error_queue
         self.bridge = bridge
         self.daemon = True
         self.running = True
+        self.mic_thread = mic_thread  # Reference to microphone thread for cooldown management
         
         # Maintain cache of lights to avoid repeated API calls
         self.lights_cache = {}
         self.last_cache_update = 0
-        self.cache_ttl = 60  # Cache for 60 seconds
+        self.cache_ttl = CONFIG["cache_ttl"]  # Use config value
         
         # Store command history
-        self.command_history = deque(maxlen=10)
+        self.command_history = deque(maxlen=CONFIG["max_command_history"])  # Use config value
         
         # Store light states for undo functionality
-        self.light_state_history = deque(maxlen=5)
+        self.light_state_history = deque(maxlen=CONFIG["max_state_history"])  # Use config value
         
         # Store active timers
         self.active_timers = {}
-        
+    
     def run(self):
-        """Thread function for command processing"""
-        logger.info("Command processor thread started")
-        
-        while self.running:
-            try:
-                if not self.command_queue.empty():
-                    command_data = self.command_queue.get(block=False)
-                    
-                    # Handle different command types
-                    if isinstance(command_data, dict):
-                        if command_data["type"] == "wake_word_detected":
-                            # Wake word detected, nothing to do here as the microphone
-                            # thread will be activated separately
-                            pass
-                        elif command_data["type"] == "command":
-                            # Process actual voice command
-                            self.process_command(command_data["text"])
-                        elif command_data["type"] == "timer":
-                            # Process timer expiration
-                            self.process_timer_expiration(command_data["timer_id"], command_data["action"])
+        """Main thread function for processing commands"""
+        try:
+            # Process commands from the queue
+            while self.running:
+                try:
+                    if not self.command_queue.empty():
+                        command_data = self.command_queue.get(block=False)
+                        
+                        # Process different types of commands
+                        if isinstance(command_data, dict):
+                            # Structured command
+                            if command_data.get("type") == "wake_word_detected":
+                                # Wake word detected, nothing to do here
+                                pass
+                            elif command_data.get("type") == "timer":
+                                # Timer event
+                                self.process_timer_expiration(command_data["timer_id"], command_data["action"])
+                        else:
+                            # Legacy format, plain text command
+                            self.process_command(command_data)
+                            
+                            # Trigger cooldown after processing
+                            if self.mic_thread:
+                                self.mic_thread.command_executed()
                     else:
-                        # Legacy format, plain text command
-                        self.process_command(command_data)
-                else:
-                    # Don't busy-wait, sleep for a short time if no commands
-                    time.sleep(0.1)
+                        # Don't busy-wait, sleep for a short time if no commands
+                        time.sleep(0.1)
                     
-            except queue.Empty:
-                time.sleep(0.1)
-            except Exception as e:
-                self.error_queue.put(e)
-                
+                except queue.Empty:
+                    time.sleep(0.1)
+                except Exception as e:
+                    self.error_queue.put(e)
+        except Exception as e:
+            logger.error(f"Error in command processor: {str(e)}")
+            self.error_queue.put(e)
+    
     def get_specific_lights(self, command, refresh_cache=False):
         """Get all available lights with caching"""
         current_time = time.time()
@@ -672,7 +706,15 @@ class CommandProcessor(threading.Thread):
         for light in lights:
             light.on = True
         play_sound('command_executed')
-        speak_text("Turning the lights on")
+        try:
+            if os.name == 'posix':  # macOS
+                os.system('say "Turning the lights on"')
+            elif os.name == 'nt':  # Windows
+                os.system('echo Turning the lights on | powershell -command "& {$player = New-Object Media.SoundPlayer; $player.PlaySync()}"')
+            else:
+                logger.info("Voice feedback: Turning the lights on")
+        except Exception as e:
+            logger.error(f"Error with simple text-to-speech: {str(e)}")
     
     def turn_off_lights(self, lights, command=None):
         """Turn lights off"""
@@ -680,8 +722,16 @@ class CommandProcessor(threading.Thread):
         for light in lights:
             light.on = False
         play_sound('command_executed')
-        speak_text("Turning the lights off")
-    
+        try:
+            if os.name == 'posix':  # macOS
+                os.system('say "Turning the lights off"')
+            elif os.name == 'nt':  # Windows
+                os.system('echo Turning the lights off | powershell -command "& {$player = New-Object Media.SoundPlayer; $player.PlaySync()}"')
+            else:
+                logger.info("Voice feedback: Turning the lights off")
+        except Exception as e:
+            logger.error(f"Error with simple text-to-speech: {str(e)}")
+            
     def dim_lights(self, lights, command=None):
         """Dim the lights by 20%"""
         logger.info("Dimming lights")
@@ -694,7 +744,15 @@ class CommandProcessor(threading.Thread):
                 new_brightness = max(1, int(current_brightness * 0.8))
                 light.brightness = new_brightness
         play_sound('command_executed')
-        speak_text("Dimming the lights")
+        try:
+            if os.name == 'posix':  # macOS
+                os.system('say "Dimming the lights"')
+            elif os.name == 'nt':  # Windows
+                os.system('echo Dimming the lights | powershell -command "& {$player = New-Object Media.SoundPlayer; $player.PlaySync()}"')
+            else:
+                logger.info("Voice feedback: Dimming the lights")
+        except Exception as e:
+            logger.error(f"Error with simple text-to-speech: {str(e)}")
                 
     def brighten_lights(self, lights, command=None):
         """Brighten the lights by 20%"""
@@ -708,7 +766,15 @@ class CommandProcessor(threading.Thread):
                 new_brightness = min(254, int(current_brightness * 1.2))
                 light.brightness = new_brightness
         play_sound('command_executed')
-        speak_text("Brightening the lights")
+        try:
+            if os.name == 'posix':  # macOS
+                os.system('say "Brightening the lights"')
+            elif os.name == 'nt':  # Windows
+                os.system('echo Brightening the lights | powershell -command "& {$player = New-Object Media.SoundPlayer; $player.PlaySync()}"')
+            else:
+                logger.info("Voice feedback: Brightening the lights")
+        except Exception as e:
+            logger.error(f"Error with simple text-to-speech: {str(e)}")
                 
     def maximum_brightness(self, lights, command=None):
         """Set lights to maximum brightness"""
@@ -718,7 +784,15 @@ class CommandProcessor(threading.Thread):
             light.on = True
             light.brightness = 254
         play_sound('command_executed')
-        speak_text("Setting lights to maximum brightness")
+        try:
+            if os.name == 'posix':  # macOS
+                os.system('say "Setting lights to maximum brightness"')
+            elif os.name == 'nt':  # Windows
+                os.system('echo Setting lights to maximum brightness | powershell -command "& {$player = New-Object Media.SoundPlayer; $player.PlaySync()}"')
+            else:
+                logger.info("Voice feedback: Setting lights to maximum brightness")
+        except Exception as e:
+            logger.error(f"Error with simple text-to-speech: {str(e)}")
                 
     def minimum_brightness(self, lights, command=None):
         """Set lights to minimum brightness"""
@@ -728,14 +802,30 @@ class CommandProcessor(threading.Thread):
             light.on = True
             light.brightness = 1
         play_sound('command_executed')
-        speak_text("Setting lights to minimum brightness")
+        try:
+            if os.name == 'posix':  # macOS
+                os.system('say "Setting lights to minimum brightness"')
+            elif os.name == 'nt':  # Windows
+                os.system('echo Setting lights to minimum brightness | powershell -command "& {$player = New-Object Media.SoundPlayer; $player.PlaySync()}"')
+            else:
+                logger.info("Voice feedback: Setting lights to minimum brightness")
+        except Exception as e:
+            logger.error(f"Error with simple text-to-speech: {str(e)}")
     
     def undo_last_command(self):
         """Undo the last light change"""
         if not self.light_state_history:
             logger.info("No previous state to restore")
             play_sound('error')
-            speak_text("Sorry, I don't have any previous state to restore")
+            try:
+                if os.name == 'posix':  # macOS
+                    os.system('say "Sorry, I do not have any previous state to restore"')
+                elif os.name == 'nt':  # Windows
+                    os.system('echo Sorry, I do not have any previous state to restore | powershell -command "& {$player = New-Object Media.SoundPlayer; $player.PlaySync()}"')
+                else:
+                    logger.info("Voice feedback: Sorry, I do not have any previous state to restore")
+            except Exception as e:
+                logger.error(f"Error with simple text-to-speech: {str(e)}")
             return False
             
         # Get the previous light state
@@ -769,7 +859,15 @@ class CommandProcessor(threading.Thread):
                 logger.error(f"Error restoring light state: {str(e)}")
         
         play_sound('command_executed')
-        speak_text("Undoing the previous command")
+        try:
+            if os.name == 'posix':  # macOS
+                os.system('say "Undoing the previous command"')
+            elif os.name == 'nt':  # Windows
+                os.system('echo Undoing the previous command | powershell -command "& {$player = New-Object Media.SoundPlayer; $player.PlaySync()}"')
+            else:
+                logger.info("Voice feedback: Undoing the previous command")
+        except Exception as e:
+            logger.error(f"Error with simple text-to-speech: {str(e)}")
         return True
     
     def start_timer(self, amount, unit, action):
@@ -858,7 +956,7 @@ class CommandProcessor(threading.Thread):
 class MicrophoneThread(threading.Thread):
     """Thread for continuous listening through the microphone"""
     
-    def __init__(self, command_queue, error_queue):
+    def __init__(self, command_queue, error_queue, require_wake_word=False):
         threading.Thread.__init__(self)
         self.command_queue = command_queue
         self.error_queue = error_queue
@@ -866,21 +964,60 @@ class MicrophoneThread(threading.Thread):
         self.running = True
         self.recognizer = sr.Recognizer()
         
+        # Add flag to determine if wake word is required
+        self.require_wake_word = require_wake_word
+        
+        # Add cooldown tracking
+        self.last_command_time = 0
+        self.cooldown_period = CONFIG["cooldown_period"]  # Use config value
+        self.is_processing = False  # Flag to track if a command is being processed
+        
+        # Lower recognition confidence threshold
+        self.confidence_threshold = 0.3
+        
     def run(self):
         """Main thread function for microphone input"""
         try:
             # Set up speech recognition
             with sr.Microphone() as source:
                 logger.info("Calibrating for ambient noise in microphone thread...")
-                self.recognizer.adjust_for_ambient_noise(source, duration=2)
-                logger.info("Microphone thread ready and waiting for wake word trigger...")
+                self.recognizer.adjust_for_ambient_noise(source, duration=CONFIG["ambient_noise_duration"])
+                
+                if self.require_wake_word:
+                    logger.info("Microphone thread ready and waiting for wake word trigger...")
+                else:
+                    logger.info("Microphone thread listening for commands...")
                 
                 # Continuously listen for commands
                 while self.running:
                     try:
-                        logger.info("Actively listening for command...")
-                        audio = self.recognizer.listen(source, timeout=10, phrase_time_limit=5)
-                        self.process_audio(audio)
+                        # Check if we're in cooldown period
+                        current_time = time.time()
+                        time_since_last_command = current_time - self.last_command_time
+                        
+                        if self.is_processing:
+                            # Skip listening while processing a command
+                            time.sleep(0.1)
+                            continue
+                            
+                        if time_since_last_command < self.cooldown_period:
+                            # Still in cooldown period, wait
+                            remaining = self.cooldown_period - time_since_last_command
+                            if CONFIG["debug_mode"]:
+                                logger.debug(f"Cooling down: {remaining:.1f}s remaining")
+                            time.sleep(0.1)
+                            continue
+                        
+                        # Ready to listen
+                        if time_since_last_command >= self.cooldown_period and not self.is_processing:
+                            logger.info("Actively listening for command...")
+                            audio = self.recognizer.listen(
+                                source, 
+                                timeout=CONFIG["command_timeout"], 
+                                phrase_time_limit=CONFIG["phrase_time_limit"]
+                            )
+                            self.process_audio(audio)
+                            
                     except sr.WaitTimeoutError:
                         # Timeout is normal, just continue
                         continue
@@ -891,6 +1028,9 @@ class MicrophoneThread(threading.Thread):
     def process_audio(self, audio):
         """Process captured audio and send to command queue"""
         try:
+            # Set processing flag
+            self.is_processing = True
+            
             # Use Google Speech Recognition as it's more accurate
             text = self.recognizer.recognize_google(audio)
             
@@ -898,30 +1038,74 @@ class MicrophoneThread(threading.Thread):
                 # Calculate a basic confidence score (this is approximate)
                 confidence = 0.8  # Default confidence value
                 
-                logger.info(f"Command recognized: {text} (confidence: {confidence})")
+                # Check if wake word is required and present
+                if self.require_wake_word:
+                    # Look for wake word at the beginning of the phrase
+                    if text.lower().startswith(WAKE_WORD.lower()) or WAKE_WORD.lower() in text.lower():
+                        # Wake word found, remove it from the command
+                        command = text.lower().replace(WAKE_WORD.lower(), "").strip()
+                        logger.info(f"Wake word detected in: {text} (confidence: {confidence})")
+                    else:
+                        # No wake word, ignore command
+                        logger.info(f"Ignored (no wake word): {text}")
+                        self.is_processing = False
+                        return
+                else:
+                    # No wake word required in fallback mode, use the whole text
+                    command = text.strip()
                 
-                # Play sound for command recognition
-                play_sound('command_recognized')
+                # If we got here, we have a valid command
+                if command:
+                    logger.info(f"Command recognized: {command} (confidence: {confidence})")
+                    
+                    # Play sound for command recognition
+                    play_sound('command_recognized')
+                    
+                    # Use simpler text-to-speech with system tools to ensure it works
+                    try:
+                        if os.name == 'posix':  # macOS
+                            os.system(f'say "I heard: {command}"')
+                        elif os.name == 'nt':  # Windows
+                            os.system(f'echo I heard: {command} | powershell -command "& {{[System.Console]::Beep(800, 200); Start-Sleep -m 200}}"')
+                        else:
+                            logger.info(f"Voice feedback: I heard: {command}")
+                    except Exception as e:
+                        logger.error(f"Error with simple text-to-speech: {str(e)}")
+                    
+                    # Send the recognized text to the command queue
+                    self.command_queue.put(command)
+                    
+                    # Provide visual feedback
+                    send_notification("Hue Voice Control", f"Command: {command}")
+                    
+                    # Update the last command time
+                    self.last_command_time = time.time()
                 
-                # Read back the recognized command
-                speak_text(f"I heard: {text}")
-                
-                # Send the recognized text to the command queue
-                self.command_queue.put(text)
-                
-                # Provide visual feedback
-                send_notification("Hue Voice Control", f"Command: {text}")
         except sr.UnknownValueError:
             # This is normal when no speech is detected
             pass
         except sr.RequestError as e:
             logger.error(f"Error with speech recognition service: {str(e)}")
             play_sound('error')
-            speak_text("Sorry, I couldn't reach the speech recognition service")
+            try:
+                if os.name == 'posix':  # macOS
+                    os.system('say "Sorry, I could not reach the speech recognition service"')
+                else:
+                    logger.info("Sorry, I could not reach the speech recognition service")
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Error processing audio: {str(e)}")
             self.error_queue.put(e)
+        finally:
+            # Clear processing flag
+            self.is_processing = False
     
+    def command_executed(self):
+        """Called when a command has been executed to reset the cooldown timer"""
+        self.last_command_time = time.time()
+        logger.info(f"Cooldown period started for {self.cooldown_period} seconds")
+        
     def stop(self):
         """Stop the thread"""
         self.running = False
@@ -964,9 +1148,13 @@ class HueVoiceControl:
         self.recognizer_thread = None
         self.processor_thread = None
         
+        # Initialize recognizer
+        self.recognizer = sr.Recognizer()
+        
         # Initialize queues for inter-thread communication
         self.command_queue = queue.Queue()
         self.error_queue = queue.Queue()
+        self.audio_queue = queue.Queue()  # Add audio queue for communication between mic and recognizer
         
         # Connect to the bridge
         self.connect_to_bridge()
@@ -1009,11 +1197,7 @@ class HueVoiceControl:
             return False
 
     def start(self):
-        """Start all the worker threads"""
-        if not self.bridge:
-            logger.error("Cannot start - Bridge not connected")
-            return False
-        
+        """Start the voice control system"""
         try:
             # Create and start the wake word detection thread
             self.wake_thread = WakeWordListener(
@@ -1044,12 +1228,12 @@ class HueVoiceControl:
             self.processor_thread = CommandProcessor(
                 self.command_queue,
                 self.error_queue,
-                self.bridge
+                self.bridge,
+                self.mic_thread
             )
             self.processor_thread.start()
             
             return True
-            
         except Exception as e:
             logger.error(f"Error starting threads: {str(e)}")
             self.stop()
@@ -1128,9 +1312,9 @@ class HueVoiceControl:
             # Skip wake word detection completely in fallback mode
             
             # Create speech recognition and command threads
-            self.mic_thread = MicrophoneThread(self.command_queue, self.error_queue)
+            self.mic_thread = MicrophoneThread(self.command_queue, self.error_queue, require_wake_word=False)
             self.recognizer_thread = SpeechRecognizer(self.command_queue, self.error_queue)
-            self.processor_thread = CommandProcessor(self.command_queue, self.error_queue, self.bridge)
+            self.processor_thread = CommandProcessor(self.command_queue, self.error_queue, self.bridge, self.mic_thread)
             
             # Log status
             logger.info("Initializing fallback mode (without wake word detection)")
@@ -1140,7 +1324,7 @@ class HueVoiceControl:
             self.recognizer_thread.start()
             self.mic_thread.start()
             
-            # Initialize and start threads
+            # Log thread status
             logger.info("Speech recognition thread started")
             logger.info("Command processor thread started")
             
@@ -1152,24 +1336,16 @@ class HueVoiceControl:
     def run_fallback_mode(self):
         """Run in fallback mode without wake word detection"""
         try:
-            logger.info("="*50)
-            logger.info("Enhanced Philips Hue Voice Control")
-            logger.info("="*50)
-            logger.info("FALLBACK MODE - No wake word needed")
-            logger.info("Voice commands will be processed continuously")
-            logger.info("New features:")
-            logger.info("- Audio feedback for commands")
-            logger.info("- Voice readback of commands and actions")
-            logger.info("- Command chaining (e.g. 'turn on lights and set to 50 percent')")
-            logger.info("- Undo functionality (say 'undo' or 'revert')")
-            logger.info("- Timer support (e.g. 'in 5 minutes turn off lights')")
-            logger.info("- Desktop notifications for feedback")
-            logger.info("="*50)
-            
             # Connect to the bridge
             if not self.connect_to_bridge():
                 logger.error("Could not connect to Hue Bridge. Check your IP address and try again.")
-                speak_text("Could not connect to the Hue Bridge. Please check your connection.")
+                try:
+                    if os.name == 'posix':  # macOS
+                        os.system('say "Could not connect to the Hue Bridge. Please check your connection."')
+                    else:
+                        logger.info("Voice feedback: Could not connect to the Hue Bridge. Please check your connection.")
+                except Exception as e:
+                    logger.error(f"Error with simple text-to-speech: {str(e)}")
                 return False
             
             logger.info("Successfully connected to Hue Bridge!")
@@ -1177,26 +1353,129 @@ class HueVoiceControl:
             # Start processing in fallback mode
             if not self.start_fallback_mode():
                 logger.error("Failed to start fallback mode")
-                speak_text("Failed to start the system. Please try again.")
+                try:
+                    if os.name == 'posix':  # macOS
+                        os.system('say "Failed to start the system. Please try again."')
+                    else:
+                        logger.info("Voice feedback: Failed to start the system. Please try again.")
+                except Exception as e:
+                    logger.error(f"Error with simple text-to-speech: {str(e)}")
                 return False
             
             # Play a sound to indicate successful startup
             play_sound('command_executed')
-            speak_text("Philips Hue voice control is ready. You can speak commands directly.")
+            
+            # Provide startup message with direct OS command for reliability
+            try:
+                if os.name == 'posix':  # macOS
+                    os.system('say "Philips Hue voice control is ready. You can speak commands directly."')
+                elif os.name == 'nt':  # Windows
+                    os.system('echo Philips Hue voice control is ready. You can speak commands directly. | powershell -command "& {$player = New-Object Media.SoundPlayer; $player.PlaySync()}"')
+                else:
+                    logger.info("Voice feedback: Philips Hue voice control is ready. You can speak commands directly.")
+            except Exception as e:
+                logger.error(f"Error with simple text-to-speech: {str(e)}")
             
             # Keep running until explicitly stopped
             try:
+                error_count = 0
+                max_errors = 5
+                error_reset_time = 30  # Reset error count after 30 seconds
+                last_error_time = 0
+                
                 while self.running:
                     # Check for thread errors
                     if not self.error_queue.empty():
                         error = self.error_queue.get(block=False)
+                        current_time = time.time()
+                        
+                        # Reset error count if it's been a while since the last error
+                        if current_time - last_error_time > error_reset_time:
+                            error_count = 0
+                            
+                        # Track error
+                        error_count += 1
+                        last_error_time = current_time
+                        
                         logger.error(f"Error from thread: {str(error)}")
+                        
+                        # Check if we need to restart threads due to many errors
+                        if error_count >= max_errors:
+                            logger.warning(f"Detected {error_count} errors in {error_reset_time}s, attempting recovery")
+                            try:
+                                if os.name == 'posix':  # macOS
+                                    os.system('say "System is having issues. Attempting to recover."')
+                                else:
+                                    logger.info("Voice feedback: System is having issues. Attempting to recover.")
+                            except Exception:
+                                pass
+                            
+                            # Restart threads
+                            self.stop()
+                            time.sleep(1)
+                            if not self.start_fallback_mode():
+                                logger.error("Failed to restart after errors")
+                                try:
+                                    if os.name == 'posix':  # macOS
+                                        os.system('say "Recovery failed. Please restart the application."')
+                                    else:
+                                        logger.info("Voice feedback: Recovery failed. Please restart the application.")
+                                except Exception:
+                                    pass
+                                return False
+                                
+                            # Reset error tracking
+                            error_count = 0
+                            try:
+                                if os.name == 'posix':  # macOS
+                                    os.system('say "System recovered successfully"')
+                                else:
+                                    logger.info("Voice feedback: System recovered successfully")
+                            except Exception:
+                                pass
+                    
+                    # Check if threads are still alive
+                    if (not self.mic_thread.is_alive() or 
+                        not self.recognizer_thread.is_alive() or 
+                        not self.processor_thread.is_alive()):
+                        
+                        logger.error("One or more threads have stopped")
+                        
+                        # Try to restart
+                        self.stop()
+                        time.sleep(1)
+                        if not self.start_fallback_mode():
+                            logger.error("Failed to restart threads")
+                            try:
+                                if os.name == 'posix':  # macOS
+                                    os.system('say "System has encountered a critical error. Please restart the application."')
+                                else:
+                                    logger.info("Voice feedback: System has encountered a critical error. Please restart the application.")
+                            except Exception:
+                                pass
+                            return False
+                            
+                        logger.info("Threads restarted successfully")
+                        try:
+                            if os.name == 'posix':  # macOS
+                                os.system('say "System has recovered from an error"')
+                            else:
+                                logger.info("Voice feedback: System has recovered from an error")
+                        except Exception:
+                            pass
                     
                     # Sleep to avoid busy-waiting
                     time.sleep(0.5)
+                    
             except KeyboardInterrupt:
                 logger.info("Keyboard interrupt received, shutting down...")
-                speak_text("Shutting down. Goodbye!")
+                try:
+                    if os.name == 'posix':  # macOS
+                        os.system('say "Shutting down. Goodbye!"')
+                    else:
+                        logger.info("Voice feedback: Shutting down. Goodbye!")
+                except Exception:
+                    pass
             finally:
                 self.stop()
                 
@@ -1212,6 +1491,13 @@ def main():
     try:
         # Parse command line arguments
         fallback_mode = "--fallback" in sys.argv
+        debug_mode = "--debug" in sys.argv
+        
+        # Update config based on flags
+        if debug_mode:
+            CONFIG["debug_mode"] = True
+            logging.getLogger().setLevel(logging.DEBUG)
+            logger.info("Debug mode enabled")
         
         # Define wake word at global scope to avoid reference errors
         global WAKE_WORD
@@ -1220,19 +1506,14 @@ def main():
         logger.info("Enhanced Philips Hue Voice Control")
         logger.info("="*50)
         
-        if fallback_mode:
-            logger.info("Starting in FALLBACK MODE without wake word detection")
-            logger.info("Voice commands will be processed continuously")
-            
-            # Create controller and run in fallback mode directly
-            hue_controller = HueVoiceControl()
-            hue_controller.run_fallback_mode()
-        else:
-            # Only try wake word detection in regular mode
+        # Try standard mode first unless fallback mode is explicitly requested
+        if not fallback_mode:
+            logger.info("Attempting to start with wake word detection...")
             logger.info(f"Wake word: '{WAKE_WORD}'")
             logger.info("Say the wake word to activate voice recognition")
             logger.info("New features:")
-            logger.info("- Local wake word detection")
+            logger.info("- Local wake word detection (when available)")
+            logger.info("- Voice feedback for commands")
             logger.info("- Command chaining (e.g. 'turn on lights and set to 50 percent')")
             logger.info("- Undo functionality (say 'undo' or 'revert')")
             logger.info("- Timer support (e.g. 'in 5 minutes turn off lights')")
@@ -1240,23 +1521,41 @@ def main():
             logger.info("="*50)
             
             try:
-                hue_controller = HueVoiceControl()
-                hue_controller.run()
+                controller = HueVoiceControl()
+                controller.run()
+                return 0  # Exit if successful
             except Exception as e:
-                logger.error(f"Error setting up wake word: {str(e)}")
-                logger.error("The wake word detection API now requires an access key.")
-                logger.info("Running in fallback mode instead...")
-                
-                # Run in fallback mode as a backup
-                hue_controller = HueVoiceControl()
-                hue_controller.run_fallback_mode()
+                logger.warning(f"Wake word detection failed: {str(e)}")
+                logger.info("Falling back to continuous listening mode")
+                # Continue to fallback mode
+        
+        # Either fallback was requested or standard mode failed
+        logger.info("Starting in continuous listening mode")
+        logger.info("Voice commands will be processed continuously")
+        logger.info("New features:")
+        logger.info("- Voice feedback for commands")
+        logger.info("- Command chaining (e.g. 'turn on lights and set to 50 percent')")
+        logger.info("- Undo functionality (say 'undo' or 'revert')")
+        logger.info("- Timer support (e.g. 'in 5 minutes turn off lights')")
+        logger.info("- Desktop notifications for feedback")
+        logger.info("="*50)
+        
+        controller = HueVoiceControl()
+        controller.run_fallback_mode()
                 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received, shutting down...")
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
-        logger.info("Try running with --fallback flag to bypass wake word detection:")
-        logger.info("python hue_voice_control_enhanced.py --fallback")
+        # If all else fails, provide help message
+        print("\nUsage:")
+        print("  python hue_voice_control_enhanced.py [options]")
+        print("\nOptions:")
+        print("  --fallback    Run in continuous listening mode without wake word")
+        print("  --debug       Enable debug logging")
+        print("\nTroubleshooting:")
+        print("  - If you experience issues with wake word detection, use --fallback")
+        print("  - For detailed logs, use --debug")
         return 1
                 
     return 0
